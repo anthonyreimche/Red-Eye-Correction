@@ -347,12 +347,6 @@ export function activate(api) {
     dev().setDynParams({ [KGEO(slot)]: [0, 0, 0, 0], [KPAR(slot)]: [0, 0, 0, 0], [KCOUNT]: countPresent(merged) });
   }
 
-  function clearAll() {
-    const patch = { [KCOUNT]: 0 };
-    for (let i = 0; i < MAX_SPOTS; i++) { patch[KGEO(i)] = [0, 0, 0, 0]; patch[KPAR(i)] = [0, 0, 0, 0]; }
-    dev().setDynParams(patch);
-  }
-
   const commit = () => void dev().commitEdit("Red eye");
   const defaultPar = () => [S("feather") / 100, S("desat") / 100, S("darken") / 100, 1];
 
@@ -426,7 +420,14 @@ export function activate(api) {
       let space = false, mod = false;
       const sync = () => setPassthrough(space || mod);
       const down = (e) => {
-        if (e.key === "Escape") { useTool.getState().setActive(false); return; } // finish
+        if (e.key === "Escape" || e.code === "Escape") {
+          // Finish correcting. Consume it so nothing else also acts on Esc.
+          e.preventDefault();
+          e.stopPropagation();
+          space = false; mod = false; sync();
+          useTool.getState().setActive(false);
+          return;
+        }
         if (e.code === "Space") space = true;
         if (e.key === "Control" || e.key === "Meta") mod = true;
         if (space || mod) sync();
@@ -684,10 +685,6 @@ export function activate(api) {
             disabled: busy || !photoId,
             onClick: detect,
           }, busy ? "Scanning…" : "Auto-detect all"),
-          spots.length > 0 && h("button", {
-            className: `${btn} ${plainBtn}`,
-            onClick: () => { clearAll(); useTool.getState().select(null); commit(); setStatus(""); },
-          }, "Clear"),
         ),
         active && h("div", { className: "text-[10px] text-text-muted" }, TOOL_HINT),
         status && h("div", { className: "text-[10px] text-text-muted" }, status),

@@ -17,7 +17,7 @@ Open a photo in **Develop**. The **Red Eye** panel docks in the right rail.
   - **Click** an eye to drop a correction (it auto-sizes to the pupil if detection finds one there).
   - **Drag** while placing to set the radius by hand.
   - **Drag a ring** to move it; **drag its edge** to resize.
-- In the list, the eye icon (◉ / ○) hides/shows a correction, and ✕ removes it. **Clear** removes all.
+- In the list, the eye icon (◉ / ○) hides/shows a correction, and ✕ removes it.
 - Select a correction (click its ring or list row) to tune **Size**, **Darken**, **Desaturate**, and **Feather**. With nothing selected, those sliders edit the defaults used for new corrections.
 
 Pan/zoom stays live while correcting: hold **Space** or **Ctrl/⌘** and drag to pan, tap to toggle 100%↔fit — the same modifier the built-in Heal tool uses. The rings are anchored to the image, so they track it as you pan and zoom.
