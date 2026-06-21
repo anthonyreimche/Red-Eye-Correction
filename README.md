@@ -13,7 +13,7 @@ Extensions panel (**View ▸ Extensions**) → enter `owner/safelight-redeye` (o
 Open a photo in **Develop**. The **Red Eye** panel docks in the right rail.
 
 - **Auto-detect all** — scans the photo for compact, strongly red blobs and corrects each one.
-- **Correct / Done** — toggles the on-canvas tool. While active:
+- **Correct / Done** — toggles the on-canvas tool (or press **Esc** to finish). While active:
   - **Click** an eye to drop a correction (it auto-sizes to the pupil if detection finds one there).
   - **Drag** while placing to set the radius by hand.
   - **Drag a ring** to move it; **drag its edge** to resize.

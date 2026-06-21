@@ -116,7 +116,10 @@ ${calls}  return c;
     name: "Red Eye Correction",
     phase: "effects",
     priority: 40, // before vignette/grain; operates on display-referred color
-    glsl: "c = reApply(c, vUv);",
+    // srcUv is the source-anchored UV (after crop/transform/lens) that masks and
+    // retouch use — NOT vUv, which spans only the visible window when zoomed. Using
+    // srcUv keeps the correction locked to the eye at any zoom / crop / rotation.
+    glsl: "c = reApply(c, srcUv);",
     helpers,
     uniforms,
   };
@@ -399,12 +402,14 @@ export function activate(api) {
   // --- canvas overlay -----------------------------------------------------
 
   function Overlay() {
-    const { rect } = api.develop.useDevelopOverlay();
+    // imageRect + mapping helpers map source-UV <-> screen accounting for
+    // zoom/pan/crop/straighten — the same mapping the built-in Heal overlay uses.
+    const { imageRect, toScreen, toImage, radiusToScreen, radiusToImage } = api.develop.useDevelopOverlay();
     const paramBag = useDevelopStore((s) => s.paramBag);
     const active = useTool((s) => s.active);
     const selected = useTool((s) => s.selected);
     const photoId = useDevelopStore((s) => s.photoId);
-    const [cursor, setCursor] = React.useState(null); // {x,y} local px
+    const [cursor, setCursor] = React.useState(null); // {x,y} frame px
     // While a pan/zoom gesture key (Space or Ctrl/⌘) is held, turn the overlay
     // click-through so the viewport beneath handles pan/zoom — same modifier the
     // built-in Heal tool uses. Keeps pan/zoom live and the marks glued to the image.
@@ -421,6 +426,7 @@ export function activate(api) {
       let space = false, mod = false;
       const sync = () => setPassthrough(space || mod);
       const down = (e) => {
+        if (e.key === "Escape") { useTool.getState().setActive(false); return; } // finish
         if (e.code === "Space") space = true;
         if (e.key === "Control" || e.key === "Meta") mod = true;
         if (space || mod) sync();
@@ -441,12 +447,12 @@ export function activate(api) {
       };
     }, [active]);
 
-    // Rings only show while the tool is active (matches the built-in Heal tool;
-    // keeps the photo clean during normal viewing).
-    if (!rect || !active) return null;
+    // Rings only show while the tool is active (matches the built-in Heal tool).
+    // Mapping helpers are null until the first frame lays out.
+    if (!active || !imageRect || !toScreen) return null;
     const spots = readSpots(paramBag);
+    const aspect = photoAspect(); // full-image w/h, keeps discs round in source UV
 
-    const toScreen = (cx, cy) => ({ x: rect.x + cx * rect.w, y: rect.y + cy * rect.h });
     const local = (e) => {
       const r = e.currentTarget.getBoundingClientRect();
       return { x: e.clientX - r.left, y: e.clientY - r.top };
@@ -457,45 +463,42 @@ export function activate(api) {
       for (let i = spots.length - 1; i >= 0; i--) {
         const sp = spots[i];
         const c = toScreen(sp.cx, sp.cy);
-        const dx = (lx - c.x) / Math.max(1, sp.rx * rect.w);
-        const dy = (ly - c.y) / Math.max(1, sp.ry * rect.h);
-        const dist = Math.hypot(dx, dy);
+        const rs = Math.max(6, radiusToScreen(sp.ry));
+        const dist = Math.hypot(lx - c.x, ly - c.y) / rs;
         if (dist <= 1.35) return { slot: sp.slot, mode: dist > 0.7 ? "resize" : "move" };
       }
       return null;
     }
 
     function onPointerDown(e) {
-      if (!active || e.button !== 0) return;
+      if (e.button !== 0) return;
       e.preventDefault();
       e.stopPropagation();
       e.currentTarget.setPointerCapture(e.pointerId);
-      const lx = local(e).x, ly = local(e).y;
-      const hit = hitSpot(lx, ly);
+      const l = local(e);
+      const hit = hitSpot(l.x, l.y);
       if (hit) {
         useTool.getState().select(hit.slot);
         const sp = spots.find((s) => s.slot === hit.slot);
-        const c = toScreen(sp.cx, sp.cy);
-        drag.current = { slot: hit.slot, mode: hit.mode, offX: c.x - lx, offY: c.y - ly };
+        // Track the move as a source-UV delta so it's correct at any zoom/crop.
+        drag.current = { slot: hit.slot, mode: hit.mode, downUV: toImage(l.x, l.y), cx0: sp.cx, cy0: sp.cy };
         return;
       }
       // Create on empty space.
-      const bag = dev().paramBag;
-      const slot = nextFreeSlot(bag);
+      const slot = nextFreeSlot(dev().paramBag);
       if (slot < 0) return; // full
-      const ux = (lx - rect.x) / rect.w;
-      const uy = (ly - rect.y) / rect.h;
+      const uv = toImage(l.x, l.y);
       let geo;
-      const near = findBlobNear(ux, uy);
+      const near = findBlobNear(uv.x, uv.y);
       if (near) geo = blobToGeo(near);
       else {
         const ry = S("size") / 100;
-        geo = [ux, uy, ry * rect.h / rect.w, ry];
+        geo = [uv.x, uv.y, ry / aspect, ry];
       }
       applySpot(slot, geo, defaultPar(), false);
       useTool.getState().select(slot);
       // Drag immediately resizes (manual override of the auto/default radius).
-      drag.current = { slot, mode: "resize", offX: 0, offY: 0, created: true };
+      drag.current = { slot, mode: "resize", created: true };
     }
 
     function findBlobNear(ux, uy) {
@@ -512,25 +515,23 @@ export function activate(api) {
 
     function onPointerMove(e) {
       const l = local(e);
-      setCursor(active ? l : null);
+      setCursor(l);
       const d = drag.current;
       if (!d) return;
       e.stopPropagation();
       const sp = readSpots(dev().paramBag).find((s) => s.slot === d.slot);
       if (!sp) return;
       if (d.mode === "move") {
-        const cx = Math.min(1, Math.max(0, (l.x + d.offX - rect.x) / rect.w));
-        const cy = Math.min(1, Math.max(0, (l.y + d.offY - rect.y) / rect.h));
+        const cur = toImage(l.x, l.y);
+        const cx = Math.min(1, Math.max(0, d.cx0 + (cur.x - d.downUV.x)));
+        const cy = Math.min(1, Math.max(0, d.cy0 + (cur.y - d.downUV.y)));
         applySpot(d.slot, [cx, cy, sp.rx, sp.ry], null, true);
       } else {
         const c = toScreen(sp.cx, sp.cy);
         const rscreen = Math.max(4, Math.hypot(l.x - c.x, l.y - c.y));
-        let rx = rscreen / rect.w;
-        let ry = rscreen / rect.h;
-        const maxRy = 0.25, minRy = 0.003; // clamp to sane pupil sizes
-        if (ry > maxRy) { rx *= maxRy / ry; ry = maxRy; }
-        if (ry < minRy) { rx *= minRy / ry; ry = minRy; }
-        applySpot(d.slot, [sp.cx, sp.cy, rx, ry], null, true);
+        let ry = radiusToImage(rscreen);
+        ry = Math.min(0.25, Math.max(0.003, ry)); // clamp to sane pupil sizes
+        applySpot(d.slot, [sp.cx, sp.cy, ry / aspect, ry], null, true);
       }
     }
 
@@ -546,11 +547,11 @@ export function activate(api) {
     const els = [];
     for (const sp of spots) {
       const c = toScreen(sp.cx, sp.cy);
-      const rx = sp.rx * rect.w, ry = sp.ry * rect.h;
+      const r = Math.max(2, radiusToScreen(sp.ry));
       const sel = sp.slot === selected;
       const stroke = !sp.enabled ? "#8a8a8a" : sel ? "#ffffff" : "#e0e0e0";
-      els.push(h("ellipse", {
-        key: `e${sp.slot}`, cx: c.x, cy: c.y, rx, ry, fill: "none",
+      els.push(h("circle", {
+        key: `e${sp.slot}`, cx: c.x, cy: c.y, r, fill: "none",
         stroke, strokeWidth: sel ? 2 : 1.2,
         strokeDasharray: sp.enabled ? (sel ? undefined : "3 3") : "2 4",
         opacity: sp.enabled ? 0.9 : 0.4,
@@ -560,9 +561,8 @@ export function activate(api) {
       }
     }
     if (!passthrough && cursor && !drag.current) {
-      const ry = (S("size") / 100) * rect.h;
       els.push(h("circle", {
-        key: "cursor", cx: cursor.x, cy: cursor.y, r: Math.max(4, ry),
+        key: "cursor", cx: cursor.x, cy: cursor.y, r: Math.max(4, radiusToScreen(S("size") / 100)),
         fill: "none", stroke: "#e0e0e0", strokeWidth: 1, strokeDasharray: "2 2", opacity: 0.6,
       }));
     }
