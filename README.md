@@ -20,6 +20,8 @@ Open a photo in **Develop**. The **Red Eye** panel docks in the right rail.
 - In the list, the eye icon (◉ / ○) hides/shows a correction, and ✕ removes it. **Clear** removes all.
 - Select a correction (click its ring or list row) to tune **Size**, **Darken**, **Desaturate**, and **Feather**. With nothing selected, those sliders edit the defaults used for new corrections.
 
+Pan/zoom stays live while correcting: hold **Space** or **Ctrl/⌘** and drag to pan, tap to toggle 100%↔fit — the same modifier the built-in Heal tool uses. The rings are anchored to the image, so they track it as you pan and zoom.
+
 Up to **8** corrections per photo.
 
 ## How the correction works

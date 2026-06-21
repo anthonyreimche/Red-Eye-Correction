@@ -25,6 +25,7 @@ const KPAR = (i) => `${STAGE_ID}.uRePar${i}`; // vec4 [feather, desat, darken, e
 const KCOUNT = `${STAGE_ID}.uReCount`;
 
 let unregisterStage = null; // set in activate, called from deactivate
+let unsubTool = null; // store subscription teardown
 
 // ---------------------------------------------------------------------------
 // Settings (edited via the ⚙ dialog in the Extensions panel)
@@ -259,6 +260,16 @@ export function activate(api) {
     select: (selected) => set({ selected }),
   }));
 
+  // Red Eye and the core tools (mask / heal / HSL picker) are mutually exclusive.
+  // If another tool takes over (activeTool leaves "none"), drop out of correction
+  // mode so our overlay stops capturing pointer events — otherwise it would sit on
+  // top of the canvas and block the active tool *and* pan/zoom.
+  unsubTool = useDevelopStore.subscribe((s) => {
+    if (s.activeTool !== "none" && useTool.getState().active) {
+      useTool.getState().setActive(false);
+    }
+  });
+
   // --- spot read/write over the per-photo param bag -----------------------
 
   function readSpots(bag) {
@@ -394,12 +405,41 @@ export function activate(api) {
     const selected = useTool((s) => s.selected);
     const photoId = useDevelopStore((s) => s.photoId);
     const [cursor, setCursor] = React.useState(null); // {x,y} local px
+    // While a pan/zoom gesture key (Space or Ctrl/⌘) is held, turn the overlay
+    // click-through so the viewport beneath handles pan/zoom — same modifier the
+    // built-in Heal tool uses. Keeps pan/zoom live and the marks glued to the image.
+    const [passthrough, setPassthrough] = React.useState(false);
     const drag = React.useRef(null);
 
     // Prefetch detection so a click can auto-size synchronously.
     React.useEffect(() => {
       if (active) void ensureAnalysis();
     }, [active, photoId]);
+
+    React.useEffect(() => {
+      if (!active) { setPassthrough(false); return; }
+      let space = false, mod = false;
+      const sync = () => setPassthrough(space || mod);
+      const down = (e) => {
+        if (e.code === "Space") space = true;
+        if (e.key === "Control" || e.key === "Meta") mod = true;
+        if (space || mod) sync();
+      };
+      const up = (e) => {
+        if (e.code === "Space") space = false;
+        mod = e.ctrlKey || e.metaKey; // resync from the event's modifier state
+        sync();
+      };
+      const reset = () => { space = false; mod = false; sync(); };
+      window.addEventListener("keydown", down, true);
+      window.addEventListener("keyup", up, true);
+      window.addEventListener("blur", reset);
+      return () => {
+        window.removeEventListener("keydown", down, true);
+        window.removeEventListener("keyup", up, true);
+        window.removeEventListener("blur", reset);
+      };
+    }, [active]);
 
     // Rings only show while the tool is active (matches the built-in Heal tool;
     // keeps the photo clean during normal viewing).
@@ -519,7 +559,7 @@ export function activate(api) {
         els.push(h("circle", { key: `d${sp.slot}`, cx: c.x, cy: c.y, r: 1.5, fill: "#ffffff", opacity: 0.9 }));
       }
     }
-    if (active && cursor && !drag.current) {
+    if (!passthrough && cursor && !drag.current) {
       const ry = (S("size") / 100) * rect.h;
       els.push(h("circle", {
         key: "cursor", cx: cursor.x, cy: cursor.y, r: Math.max(4, ry),
@@ -530,8 +570,10 @@ export function activate(api) {
     return h("div", {
       style: {
         position: "absolute", inset: 0,
-        pointerEvents: active ? "auto" : "none",
-        cursor: active ? "crosshair" : "default",
+        // Click-through during a pan/zoom gesture so the viewport beneath drives
+        // pan/zoom; otherwise we own the pointer for placing/editing corrections.
+        pointerEvents: passthrough ? "none" : "auto",
+        cursor: passthrough ? "default" : "crosshair",
       },
       onPointerDown, onPointerMove, onPointerUp: endDrag, onPointerCancel: endDrag,
       onPointerLeave: () => setCursor(null),
@@ -702,5 +744,7 @@ export function deactivate() {
   // Panels/slots/settings are auto-swept by the host. Drop the GPU stage too so
   // disabling the extension stops contributing to the render pipeline.
   try { unregisterStage?.(); } catch { /* host may have already swept it */ }
+  try { unsubTool?.(); } catch { /* already torn down */ }
   unregisterStage = null;
+  unsubTool = null;
 }
