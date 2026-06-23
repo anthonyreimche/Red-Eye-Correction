@@ -20,7 +20,7 @@ const STAGE_ID = "redeye.correct";
 const MAX_SPOTS = 8; // dedicated budget; does NOT touch the app's mask limit
 const TOOL_HINT = "Click an eye · drag to size";
 
-const KGEO = (i) => `${STAGE_ID}.uReGeo${i}`; // vec4 [cx, cy, rx, ry] (image-UV)
+const KGEO = (i) => `${STAGE_ID}.uReGeo${i}`; // vec4 [cx, cy, radius, radius] (image-UV; radius in image-height units, aspect-corrected in the shader)
 const KPAR = (i) => `${STAGE_ID}.uRePar${i}`; // vec4 [feather, desat, darken, enabled] (0..1)
 const KCOUNT = `${STAGE_ID}.uReCount`;
 
@@ -80,8 +80,14 @@ function buildStage() {
   }
   const helpers = `vec3 reSpot(vec3 c, vec2 uv, vec4 geo, vec4 par) {
   if (par.w < 0.5) return c;            // disabled slot
-  if (geo.z <= 0.0 || geo.w <= 0.0) return c; // empty slot
-  vec2 d = (uv - geo.xy) / vec2(geo.z, geo.w); // normalize to the disc radii
+  float radius = geo.w;                 // pupil radius, image-height units
+  if (radius <= 0.0) return c;          // empty slot
+  // Aspect-correct the x axis with the true decoded-buffer aspect (uImageAspect,
+  // a core uniform) so the disc is a real circle on screen at any orientation —
+  // the same convention the built-in heal/mask tools use. (Baking per-axis radii
+  // from catalog photo.width/height skewed it into an ellipse on
+  // orientation-divergent decodes, e.g. rotated RAWs.)
+  vec2 d = vec2((uv.x - geo.x) * uImageAspect, uv.y - geo.y) / radius;
   float dist = length(d);
   if (dist > 1.0) return c;
   float feather = clamp(par.x, 0.0, 1.0);
@@ -126,42 +132,66 @@ ${calls}  return c;
 }
 
 // ---------------------------------------------------------------------------
-// Detection: redness score -> binary mask -> connected components -> filters
+// Detection: redness score -> hysteresis mask -> connected components ->
+// hole-fill -> shape/skin filters -> confidence ranking
 // ---------------------------------------------------------------------------
 
+/** Loose skin-tone test on a raw RGB triple: red leads, green follows, and the
+ *  channel spread is in a plausible range. Used to confirm a red blob is framed
+ *  by skin (an eye) rather than sitting on red cloth / a logo / a brake light. */
+function isSkin(r, g, b) {
+  return r > 80 && r > g && g >= b && r - b > 15 && r - b < 170 && r - g < 90;
+}
+
 /**
- * Scan RGBA pixels for compact, strongly red blobs.
- * Returns up to maxCount blobs as { cx, cy, radius } in *pixels* of the
- * analyzed image, sorted by confidence, overlaps deduplicated.
+ * Scan RGBA pixels for compact, strongly red, skin-framed blobs (red eyes).
+ * Returns up to maxCount blobs as { cx, cy, radius, weight } in *pixels* of the
+ * analyzed image, ranked by confidence, overlaps deduplicated.
+ *
+ * Pipeline: a per-pixel redness score gates pixels at two thresholds
+ * (hysteresis) — strong pixels seed blobs, weaker ones let a blob grow out to
+ * the full pupil rim. Each blob's central catchlight (a bright near-neutral
+ * glint that isn't "red") is folded back in so the disc reads as solid. Blobs
+ * are then filtered by size/roundness, scored by mean redness × roundness ×
+ * how much skin surrounds them, and bonused when they pair up like real eyes.
  */
 function detectRedEyes(data, w, h, opts) {
   const n = w * h;
-  const thr = 2.2 - (opts.sensitivity / 100) * 1.4;
-  const mask = new Uint8Array(n);
+  // Seed (high) threshold scales with sensitivity; the grow (low) threshold sits
+  // a fixed fraction below it so a blob captures its whole rim without leaking.
+  const thrHigh = 2.2 - (opts.sensitivity / 100) * 1.4;
+  const thrLow = thrHigh * 0.55;
+
   const score = new Float32Array(n);
+  // 0 none · 1 weak red · 2 strong-red seed · 3 catchlight glint · 9 claimed
+  const state = new Uint8Array(n);
 
   for (let i = 0, p = 0; i < n; i++, p += 4) {
-    const r = data[p];
-    if (r < 50) continue;
-    const g = data[p + 1];
-    const b = data[p + 2];
-    const s = (r * r) / (g * g + b * b + 1400);
-    if (s > thr) {
-      mask[i] = 1;
-      score[i] = s;
+    const r = data[p], g = data[p + 1], b = data[p + 2];
+    const mx = g > b ? g : b;
+    // Require red to clearly lead the brighter of g/b: this gates out bright
+    // neutral and orange/yellow pixels that the ratio alone would pass.
+    if (r >= 60 && r - mx >= 18) {
+      const s = (r * r) / (g * g + b * b + 1400);
+      if (s > thrLow) {
+        score[i] = s;
+        state[i] = s > thrHigh ? 2 : 1;
+      }
+    } else if (r > 170 && g > 170 && b > 170) {
+      state[i] = 3; // bright near-neutral -> candidate catchlight
     }
   }
 
   const minR = (opts.minPupil / 100) * h;
   const maxR = (opts.maxPupil / 100) * h;
   const stack = new Int32Array(n);
-  const blobs = [];
+  const raw = [];
 
   for (let seed = 0; seed < n; seed++) {
-    if (mask[seed] !== 1) continue;
+    if (state[seed] !== 2) continue; // only strong pixels seed a blob
     let top = 0;
     stack[top++] = seed;
-    mask[seed] = 2;
+    state[seed] = 9;
     let area = 0, sx = 0, sy = 0, weight = 0;
     let minX = w, maxX = 0, minY = h, maxY = 0;
     while (top > 0) {
@@ -176,27 +206,71 @@ function detectRedEyes(data, w, h, opts) {
       if (x > maxX) maxX = x;
       if (y < minY) minY = y;
       if (y > maxY) maxY = y;
-      if (x > 0 && mask[q - 1] === 1) { mask[q - 1] = 2; stack[top++] = q - 1; }
-      if (x < w - 1 && mask[q + 1] === 1) { mask[q + 1] = 2; stack[top++] = q + 1; }
-      if (y > 0 && mask[q - w] === 1) { mask[q - w] = 2; stack[top++] = q - w; }
-      if (y < h - 1 && mask[q + w] === 1) { mask[q + w] = 2; stack[top++] = q + w; }
+      let j;
+      if (x > 0)     { j = q - 1; if (state[j] === 1 || state[j] === 2) { state[j] = 9; stack[top++] = j; } }
+      if (x < w - 1) { j = q + 1; if (state[j] === 1 || state[j] === 2) { state[j] = 9; stack[top++] = j; } }
+      if (y > 0)     { j = q - w; if (state[j] === 1 || state[j] === 2) { state[j] = 9; stack[top++] = j; } }
+      if (y < h - 1) { j = q + w; if (state[j] === 1 || state[j] === 2) { state[j] = 9; stack[top++] = j; } }
     }
-    const radius = Math.sqrt(area / Math.PI);
-    if (radius < minR || radius > maxR) continue;
     const bw = maxX - minX + 1;
     const bh = maxY - minY + 1;
+    // Fold the central catchlight back in: bright glint pixels inside the box are
+    // part of the eye but aren't red, so the raw area underestimates the pupil.
+    let glint = 0;
+    for (let y = minY; y <= maxY; y++) {
+      for (let x = minX, idx = y * w + minX; x <= maxX; x++, idx++) {
+        if (state[idx] === 3) glint++;
+      }
+    }
+    const filled = area + glint;
+    const radius = Math.sqrt(filled / Math.PI);
+    if (radius < minR || radius > maxR) continue;
     const aspect = bw / bh;
-    if (aspect < 0.4 || aspect > 2.5) continue;
-    if (area / (bw * bh) < 0.4) continue;
-    blobs.push({ cx: sx / area, cy: sy / area, radius, weight });
+    if (aspect < 0.55 || aspect > 1.8) continue; // pupils read roughly round
+    const fill = filled / (bw * bh);
+    if (fill < 0.45) continue;                   // and roughly disc-shaped
+    raw.push({ cx: sx / area, cy: sy / area, radius, area, weight, fill });
   }
 
-  blobs.sort((a, b) => b.weight - a.weight);
+  // Skin-surround: sample a ring just outside each blob; a real eye is mostly
+  // framed by skin, a red object usually isn't.
+  const TWO_PI = Math.PI * 2;
+  for (const bl of raw) {
+    const rr = bl.radius * 1.8;
+    let skin = 0, samples = 0;
+    for (let k = 0; k < 16; k++) {
+      const a = (k / 16) * TWO_PI;
+      const x = Math.round(bl.cx + Math.cos(a) * rr);
+      const y = Math.round(bl.cy + Math.sin(a) * rr);
+      if (x < 0 || y < 0 || x >= w || y >= h) continue;
+      const p = (y * w + x) * 4;
+      samples++;
+      if (isSkin(data[p], data[p + 1], data[p + 2])) skin++;
+    }
+    bl.skinFrac = samples ? skin / samples : 0;
+    // Confidence: average redness, lifted by roundness and skin framing.
+    bl.conf = (bl.weight / bl.area) * (0.5 + 0.5 * bl.fill) * (0.4 + 0.6 * bl.skinFrac);
+  }
+
+  // Pair bonus: eyes come two-to-a-face — similar size, roughly level, a few
+  // diameters apart. A blob with such a partner is far likelier to be an eye.
+  for (const a of raw) {
+    for (const b of raw) {
+      if (a === b) continue;
+      const rAvg = (a.radius + b.radius) / 2;
+      const dx = Math.abs(a.cx - b.cx);
+      const dy = Math.abs(a.cy - b.cy);
+      const sizeOk = Math.min(a.radius, b.radius) / Math.max(a.radius, b.radius) > 0.5;
+      if (sizeOk && dy < rAvg * 3 && dx > rAvg * 1.5 && dx < rAvg * 25) { a.conf *= 1.5; break; }
+    }
+  }
+
+  raw.sort((a, b) => b.conf - a.conf);
   const out = [];
-  for (const b of blobs) {
+  for (const b of raw) {
     if (out.length >= opts.maxCount) break;
-    if (out.some((o) => Math.hypot(o.cx - b.cx, o.cy - b.cy) < o.radius + b.radius)) continue;
-    out.push(b);
+    if (out.some((o) => Math.hypot(o.cx - b.cx, o.cy - b.cy) < (o.radius + b.radius) * 0.8)) continue;
+    out.push({ cx: b.cx, cy: b.cy, radius: b.radius, weight: b.conf });
   }
   return out;
 }
@@ -350,13 +424,6 @@ export function activate(api) {
   const commit = () => void dev().commitEdit("Red eye");
   const defaultPar = () => [S("feather") / 100, S("desat") / 100, S("darken") / 100, 1];
 
-  /** Aspect (w/h) of the active photo, for converting a height-based radius to
-   *  the per-axis UV radii that keep the disc circular on screen. */
-  function photoAspect() {
-    const photo = useCatalogStore.getState().photos.find((p) => p.id === dev().photoId);
-    return photo && photo.width > 0 && photo.height > 0 ? photo.width / photo.height : 1.5;
-  }
-
   // --- detection cache (shared by Auto-detect and click-to-place) ---------
 
   let analysis = { sig: null, imgW: 0, imgH: 0, blobs: [] };
@@ -385,12 +452,13 @@ export function activate(api) {
     return analysis;
   }
 
-  /** Blob (analysis px) -> geo vec4 [cx, cy, rx, ry] in image-UV. Per-axis radii
-   *  derived from image pixel dims keep the disc circular on screen. */
+  /** Blob (analysis px) -> geo vec4 [cx, cy, radius, radius] in image-UV. The
+   *  radius is in image-height units (the shader aspect-corrects via uImageAspect),
+   *  so both slots carry the same value. */
   function blobToGeo(b) {
-    const pad = 1.3; // cover the pupil plus a little of the iris edge
-    const r = b.radius * pad;
-    return [b.cx / analysis.imgW, b.cy / analysis.imgH, r / analysis.imgW, r / analysis.imgH];
+    const pad = 1.25; // cover the pupil plus a little of the iris edge
+    const r = (b.radius * pad) / analysis.imgH;
+    return [b.cx / analysis.imgW, b.cy / analysis.imgH, r, r];
   }
 
   // --- canvas overlay -----------------------------------------------------
@@ -452,7 +520,6 @@ export function activate(api) {
     // Mapping helpers are null until the first frame lays out.
     if (!active || !imageRect || !toScreen) return null;
     const spots = readSpots(paramBag);
-    const aspect = photoAspect(); // full-image w/h, keeps discs round in source UV
 
     const local = (e) => {
       const r = e.currentTarget.getBoundingClientRect();
@@ -493,8 +560,8 @@ export function activate(api) {
       const near = findBlobNear(uv.x, uv.y);
       if (near) geo = blobToGeo(near);
       else {
-        const ry = S("size") / 100;
-        geo = [uv.x, uv.y, ry / aspect, ry];
+        const r = S("size") / 100;
+        geo = [uv.x, uv.y, r, r];
       }
       applySpot(slot, geo, defaultPar(), false);
       useTool.getState().select(slot);
@@ -530,9 +597,9 @@ export function activate(api) {
       } else {
         const c = toScreen(sp.cx, sp.cy);
         const rscreen = Math.max(4, Math.hypot(l.x - c.x, l.y - c.y));
-        let ry = radiusToImage(rscreen);
-        ry = Math.min(0.25, Math.max(0.003, ry)); // clamp to sane pupil sizes
-        applySpot(d.slot, [sp.cx, sp.cy, ry / aspect, ry], null, true);
+        let r = radiusToImage(rscreen);
+        r = Math.min(0.25, Math.max(0.003, r)); // clamp to sane pupil sizes
+        applySpot(d.slot, [sp.cx, sp.cy, r, r], null, true);
       }
     }
 
@@ -646,9 +713,8 @@ export function activate(api) {
 
     const setSize = (v) => {
       if (!sel) { api.settings.set("size", v); return; }
-      const ry = v / 100;
-      const rx = ry / photoAspect();
-      applySpot(sel.slot, [sel.cx, sel.cy, rx, ry], null, false);
+      const r = v / 100;
+      applySpot(sel.slot, [sel.cx, sel.cy, r, r], null, false);
     };
     const setPar = (key, v) => {
       if (!sel) { api.settings.set(key === "feather" ? "feather" : key === "darken" ? "darken" : "desat", v); return; }
