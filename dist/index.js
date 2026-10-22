@@ -73,7 +73,9 @@ const SETTINGS_FIELDS = [
 // green/blue average, desaturate, and darken — weighted by how red the pixel
 // actually is, so the white catchlight and surrounding skin survive.
 // reApply: 8 unrolled spot applications (no array uniforms in the GLSL path).
-function buildStage() {
+// The stage declares the display's own space, so the host adds no clip of its
+// own; reSpot clips the pixels a spot can touch, everything else passes through.
+export function buildStage() {
   let calls = "";
   for (let i = 0; i < MAX_SPOTS; i++) {
     calls += `  c = reSpot(c, uv, uReGeo${i}, uRePar${i});\n`;
@@ -94,6 +96,7 @@ function buildStage() {
   float inner = 1.0 - feather;          // hard core radius (in normalized units)
   float w = 1.0 - smoothstep(inner, 1.0, dist);
   if (w <= 0.0) return c;
+  c = clamp(c, 0.0, 1.0);
   float redness = c.r - max(c.g, c.b);  // >0 only where red dominates
   float redMask = smoothstep(0.04, 0.18, redness);
   float eff = w * redMask;
@@ -122,6 +125,7 @@ ${calls}  return c;
     name: "Red Eye Correction",
     phase: "effects",
     priority: 40, // before vignette/grain; operates on display-referred color
+    space: { encoding: "perceptual" },
     // srcUv is the source-anchored UV (after crop/transform/lens) that masks and
     // retouch use — NOT vUv, which spans only the visible window when zoomed. Using
     // srcUv keeps the correction locked to the eye at any zoom / crop / rotation.
