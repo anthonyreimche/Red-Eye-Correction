@@ -6,6 +6,6 @@
   "description": "Heal-style red eye removal: a dedicated GPU correction tool with on-canvas rings, auto-detect, and per-eye tuning. Non-destructive; doesn't use the mask budget.",
   "author": "Anthony Reimche",
   "repository": "anthonyreimche/Red-Eye-Correction-for-Safelight",
-  "minAppVersion": "2.4.3",
+  "minAppVersion": "3.2.0",
   "main": "dist/index.js"
 }

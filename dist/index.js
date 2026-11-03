@@ -74,7 +74,10 @@ const SETTINGS_FIELDS = [
 // actually is, so the white catchlight and surrounding skin survive.
 // reApply: 8 unrolled spot applications (no array uniforms in the GLSL path).
 // The stage declares the display's own space, so the host adds no clip of its
-// own; reSpot clips the pixels a spot can touch, everything else passes through.
+// own; reSpot judges redness on a clipped copy and leaves every pixel's range
+// alone, so over-range values it doesn't correct pass through. Photos on
+// process version 1 keep the correction they were edited with, which clipped
+// each pixel inside a disc in place.
 export function buildStage() {
   let calls = "";
   for (let i = 0; i < MAX_SPOTS; i++) {
@@ -96,8 +99,13 @@ export function buildStage() {
   float inner = 1.0 - feather;          // hard core radius (in normalized units)
   float w = 1.0 - smoothstep(inner, 1.0, dist);
   if (w <= 0.0) return c;
+#if SL_PROCESS_VERSION >= 2
+  vec3 cd = clamp(c, 0.0, 1.0);         // detection only; c keeps its full range
+#else
   c = clamp(c, 0.0, 1.0);
-  float redness = c.r - max(c.g, c.b);  // >0 only where red dominates
+  vec3 cd = c;
+#endif
+  float redness = cd.r - max(cd.g, cd.b); // >0 only where red dominates
   float redMask = smoothstep(0.04, 0.18, redness);
   float eff = w * redMask;
   if (eff <= 0.0) return c;             // skip catchlight / neutral pixels
@@ -314,6 +322,15 @@ function readPixels(bitmap, maxEdge) {
   return ctx.getImageData(0, 0, w, h);
 }
 
+/** Pointer position in the overlay's layout pixels, the space toImage/toScreen
+ *  use: Preferences ▸ Interface scale zooms <body>, and under CSS zoom clientX
+ *  and getBoundingClientRect() are in zoomed visual pixels. */
+export function frameLocalPoint(api, e) {
+  const r = e.currentTarget.getBoundingClientRect();
+  const z = api.stores.useSettings?.getState().uiScale || 1;
+  return { x: (e.clientX - r.left) / z, y: (e.clientY - r.top) / z };
+}
+
 // ---------------------------------------------------------------------------
 // Activation
 // ---------------------------------------------------------------------------
@@ -525,10 +542,7 @@ export function activate(api) {
     if (!active || !imageRect || !toScreen) return null;
     const spots = readSpots(paramBag);
 
-    const local = (e) => {
-      const r = e.currentTarget.getBoundingClientRect();
-      return { x: e.clientX - r.left, y: e.clientY - r.top };
-    };
+    const local = (e) => frameLocalPoint(api, e);
 
     function hitSpot(lx, ly) {
       // Topmost first (last drawn). Returns {slot, mode}.
