@@ -28,7 +28,7 @@ let unregisterStage = null; // set in activate, called from deactivate
 let unsubTool = null; // store subscription teardown
 
 // ---------------------------------------------------------------------------
-// Settings (edited via the ⚙ dialog in the Extensions panel)
+// Settings (edited via the ⚙ dialogue in the Extensions panel)
 // ---------------------------------------------------------------------------
 
 const DEFAULTS = {
@@ -90,7 +90,7 @@ export function buildStage() {
   // Aspect-correct the x axis with the true decoded-buffer aspect (uImageAspect,
   // a core uniform) so the disc is a real circle on screen at any orientation —
   // the same convention the built-in heal/mask tools use. (Baking per-axis radii
-  // from catalog photo.width/height skewed it into an ellipse on
+  // from catalogue photo.width/height skewed it into an ellipse on
   // orientation-divergent decodes, e.g. rotated RAWs.)
   vec2 d = vec2((uv.x - geo.x) * uImageAspect, uv.y - geo.y) / radius;
   float dist = length(d);
