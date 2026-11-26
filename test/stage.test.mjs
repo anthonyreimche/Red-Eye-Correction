@@ -69,7 +69,7 @@ test("gives version 3 the version 2 path, one directive per line", () => {
   }
 });
 
-test("needs Safelight 3.2.0, the first to define SL_PROCESS_VERSION", () => {
+test("needs Safelight 3.2.7, the first with the official brush and framePoint", () => {
   const manifest = JSON.parse(readFileSync(new URL("../safelight.json", import.meta.url), "utf8"));
-  assert.equal(manifest.minAppVersion, "3.2.0");
+  assert.equal(manifest.minAppVersion, "3.2.7");
 });

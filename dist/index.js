@@ -18,14 +18,16 @@
 const EXT_ID = "redeye";
 const STAGE_ID = "redeye.correct";
 const MAX_SPOTS = 8; // dedicated budget; does NOT touch the app's mask limit
-const TOOL_HINT = "Click an eye · drag to size";
+const TOOL_HINT = "Click an eye, drag to size; drag a ring to move it";
+const SIZE_MIN = 0.2; // correction radius range, % of image height
+const SIZE_MAX = 10;
+const SIZE_RANGE = { size: { min: SIZE_MIN / 100, max: SIZE_MAX / 100 } };
 
 const KGEO = (i) => `${STAGE_ID}.uReGeo${i}`; // vec4 [cx, cy, radius, radius] (image-UV; radius in image-height units, aspect-corrected in the shader)
 const KPAR = (i) => `${STAGE_ID}.uRePar${i}`; // vec4 [feather, desat, darken, enabled] (0..1)
 const KCOUNT = `${STAGE_ID}.uReCount`;
 
 let unregisterStage = null; // set in activate, called from deactivate
-let unsubTool = null; // store subscription teardown
 
 // ---------------------------------------------------------------------------
 // Settings (edited via the ⚙ dialogue in the Extensions panel)
@@ -49,7 +51,7 @@ const SETTINGS_FIELDS = [
   { key: "minPupil", label: "Min pupil size (% of height)", type: "number", default: DEFAULTS.minPupil, min: 0.05, max: 10, step: 0.05 },
   { key: "maxPupil", label: "Max pupil size (% of height)", type: "number", default: DEFAULTS.maxPupil, min: 0.5, max: 20, step: 0.5 },
   { key: "maxDetections", label: "Max detections per run", type: "number", default: DEFAULTS.maxDetections, min: 1, max: MAX_SPOTS, step: 1 },
-  { key: "size", label: "Default size (% of height)", type: "number", default: DEFAULTS.size, min: 0.2, max: 10, step: 0.1, hint: "Radius of a fresh correction before you drag/auto-size" },
+  { key: "size", label: "Default size (% of height)", type: "number", default: DEFAULTS.size, min: SIZE_MIN, max: SIZE_MAX, step: 0.1, hint: "Radius of a fresh correction before you drag/auto-size" },
   { key: "feather", label: "Default feather (%)", type: "number", default: DEFAULTS.feather, min: 0, max: 100, step: 5 },
   { key: "desat", label: "Default desaturation (%)", type: "number", default: DEFAULTS.desat, min: 0, max: 100, step: 5 },
   { key: "darken", label: "Default darken (%)", type: "number", default: DEFAULTS.darken, min: 0, max: 100, step: 5 },
@@ -322,15 +324,6 @@ function readPixels(bitmap, maxEdge) {
   return ctx.getImageData(0, 0, w, h);
 }
 
-/** Pointer position in the overlay's layout pixels, the space toImage/toScreen
- *  use: Preferences ▸ Interface scale zooms <body>, and under CSS zoom clientX
- *  and getBoundingClientRect() are in zoomed visual pixels. */
-export function frameLocalPoint(api, e) {
-  const r = e.currentTarget.getBoundingClientRect();
-  const z = api.stores.useSettings?.getState().uiScale || 1;
-  return { x: (e.clientX - r.left) / z, y: (e.clientY - r.top) / z };
-}
-
 // ---------------------------------------------------------------------------
 // Activation
 // ---------------------------------------------------------------------------
@@ -339,6 +332,7 @@ export function activate(api) {
   const { react: React, stores, components } = api;
   const { useDevelopStore, useCatalogStore, create } = stores;
   const { Panel, Slider } = components;
+  const { tokens } = api.ui;
   const h = React.createElement;
 
   const S = (key) => api.settings.get(key, DEFAULTS[key]);
@@ -348,25 +342,13 @@ export function activate(api) {
   api.registerProcessingStage(buildStage());
   unregisterStage = () => api.unregisterProcessingStage?.(STAGE_ID);
 
-  // Tool state shared by the panel and the canvas overlay. Cursor position is
-  // kept in overlay-local React state (high-frequency) so the panel never
-  // re-renders on mouse move.
+  // The selected correction, shared by the panel and the canvas overlay. Cursor
+  // position is kept in overlay-local React state (high-frequency) so the panel
+  // never re-renders on mouse move.
   const useTool = create((set) => ({
-    active: false,
     selected: null, // selected slot index, or null
-    setActive: (active) => set((s) => ({ active, selected: active ? s.selected : null })),
     select: (selected) => set({ selected }),
   }));
-
-  // Red Eye and the core tools (mask / heal / HSL picker) are mutually exclusive.
-  // If another tool takes over (activeTool leaves "none"), drop out of correction
-  // mode so our overlay stops capturing pointer events — otherwise it would sit on
-  // top of the canvas and block the active tool *and* pan/zoom.
-  unsubTool = useDevelopStore.subscribe((s) => {
-    if (s.activeTool !== "none" && useTool.getState().active) {
-      useTool.getState().setActive(false);
-    }
-  });
 
   // --- spot read/write over the per-photo param bag -----------------------
 
@@ -489,60 +471,24 @@ export function activate(api) {
     // zoom/pan/crop/straighten — the same mapping the built-in Heal overlay uses.
     const { imageRect, toScreen, toImage, radiusToScreen, radiusToImage } = api.develop.useDevelopOverlay();
     const paramBag = useDevelopStore((s) => s.paramBag);
-    const active = useTool((s) => s.active);
     const selected = useTool((s) => s.selected);
     const photoId = useDevelopStore((s) => s.photoId);
     const [cursor, setCursor] = React.useState(null); // {x,y} frame px
-    // While a pan/zoom gesture key (Space or Ctrl/⌘) is held, turn the overlay
-    // click-through so the viewport beneath handles pan/zoom — same modifier the
-    // built-in Heal tool uses. Keeps pan/zoom live and the marks glued to the image.
-    const [passthrough, setPassthrough] = React.useState(false);
+    const [, bump] = React.useReducer((n) => n + 1, 0);
     const drag = React.useRef(null);
 
     // Prefetch detection so a click can auto-size synchronously.
     React.useEffect(() => {
-      if (active) void ensureAnalysis();
-    }, [active, photoId]);
+      void ensureAnalysis();
+    }, [photoId]);
 
-    React.useEffect(() => {
-      if (!active) { setPassthrough(false); return; }
-      let space = false, mod = false;
-      const sync = () => setPassthrough(space || mod);
-      const down = (e) => {
-        if (e.key === "Escape" || e.code === "Escape") {
-          // Finish correcting. Consume it so nothing else also acts on Esc.
-          e.preventDefault();
-          e.stopPropagation();
-          space = false; mod = false; sync();
-          useTool.getState().setActive(false);
-          return;
-        }
-        if (e.code === "Space") space = true;
-        if (e.key === "Control" || e.key === "Meta") mod = true;
-        if (space || mod) sync();
-      };
-      const up = (e) => {
-        if (e.code === "Space") space = false;
-        mod = e.ctrlKey || e.metaKey; // resync from the event's modifier state
-        sync();
-      };
-      const reset = () => { space = false; mod = false; sync(); };
-      window.addEventListener("keydown", down, true);
-      window.addEventListener("keyup", up, true);
-      window.addEventListener("blur", reset);
-      return () => {
-        window.removeEventListener("keydown", down, true);
-        window.removeEventListener("keyup", up, true);
-        window.removeEventListener("blur", reset);
-      };
-    }, [active]);
+    React.useEffect(() => api.settings.onChange(bump), []); // the ring follows size/feather
 
-    // Rings only show while the tool is active (matches the built-in Heal tool).
     // Mapping helpers are null until the first frame lays out.
-    if (!active || !imageRect || !toScreen) return null;
+    if (!imageRect || !toScreen) return null;
     const spots = readSpots(paramBag);
 
-    const local = (e) => frameLocalPoint(api, e);
+    const local = (e) => api.develop.framePoint(e.currentTarget, e.clientX, e.clientY);
 
     function hitSpot(lx, ly) {
       // Topmost first (last drawn). Returns {slot, mode}.
@@ -635,7 +581,7 @@ export function activate(api) {
       const c = toScreen(sp.cx, sp.cy);
       const r = Math.max(2, radiusToScreen(sp.ry));
       const sel = sp.slot === selected;
-      const stroke = !sp.enabled ? "#8a8a8a" : sel ? "#ffffff" : "#e0e0e0";
+      const stroke = !sp.enabled ? "#8a8a8a" : sel ? tokens.white : "#e0e0e0";
       els.push(h("circle", {
         key: `e${sp.slot}`, cx: c.x, cy: c.y, r, fill: "none",
         stroke, strokeWidth: sel ? 2 : 1.2,
@@ -643,62 +589,65 @@ export function activate(api) {
         opacity: sp.enabled ? 0.9 : 0.4,
       }));
       if (sel && sp.enabled) {
-        els.push(h("circle", { key: `d${sp.slot}`, cx: c.x, cy: c.y, r: 1.5, fill: "#ffffff", opacity: 0.9 }));
+        els.push(h("circle", { key: `d${sp.slot}`, cx: c.x, cy: c.y, r: 1.5, fill: tokens.white, opacity: 0.9 }));
       }
-    }
-    if (!passthrough && cursor && !drag.current) {
-      els.push(h("circle", {
-        key: "cursor", cx: cursor.x, cy: cursor.y, r: Math.max(4, radiusToScreen(S("size") / 100)),
-        fill: "none", stroke: "#e0e0e0", strokeWidth: 1, strokeDasharray: "2 2", opacity: 0.6,
-      }));
     }
 
     return h("div", {
       style: {
         position: "absolute", inset: 0,
-        // Click-through during a pan/zoom gesture so the viewport beneath drives
-        // pan/zoom; otherwise we own the pointer for placing/editing corrections.
-        pointerEvents: passthrough ? "none" : "auto",
-        // Use the app's shared crosshair token (so Custom Cursors themes restyle it)
-        // instead of a hardcoded CSS keyword; fall back on older Safelight builds.
-        cursor: passthrough
-          ? "default"
-          : (api.cursors && api.cursors.resolve ? api.cursors.resolve("crosshair") : "crosshair"),
+        pointerEvents: "auto",
+        cursor: api.cursors.resolve("crosshair"),
       },
       onPointerDown, onPointerMove, onPointerUp: endDrag, onPointerCancel: endDrag,
       onPointerLeave: () => setCursor(null),
     }, h("svg", {
       style: { position: "absolute", inset: 0, width: "100%", height: "100%", pointerEvents: "none", overflow: "visible" },
-    }, els));
+    }, els),
+    h(api.develop.BrushCursor, { at: drag.current ? null : cursor, size: S("size") / 100, feather: S("feather") / 100 }));
   }
 
-  api.registerSlot({ id: "redeye.overlay", slot: "develop-canvas-overlay", component: Overlay, order: 40 });
+  // The official brush shortcuts set the size and feather new corrections take,
+  // held to the Size slider's range; Red Eye has no opacity or flow.
+  function brushAction(action, run) {
+    const step = api.develop.brush.step(action, { size: S("size") / 100, feather: S("feather") / 100 }, SIZE_RANGE);
+    if (!step) return false;
+    if (run) {
+      if (step.key === "size") api.settings.set("size", Math.round(step.value * 1000) / 10);
+      else api.settings.set("feather", Math.round(step.value * 100));
+    }
+    return true;
+  }
+
+  const CORRECT_TOOL = {
+    overlay: Overlay,
+    zoomable: true,
+    onEscape: () => useTool.getState().select(null),
+    onAction: (action) => brushAction(action, true),
+    wants: (action) => brushAction(action, false),
+  };
+
+  const setActive = (on) => {
+    if (!on) useTool.getState().select(null);
+    api.develop.setCanvasTool(on ? CORRECT_TOOL : null);
+  };
 
   // --- panel --------------------------------------------------------------
 
   function RedEyePanel() {
     const paramBag = useDevelopStore((s) => s.paramBag);
     const photoId = useDevelopStore((s) => s.photoId);
-    const active = useTool((s) => s.active);
+    const active = api.develop.useCanvasToolHeld();
     const selected = useTool((s) => s.selected);
     const [busy, setBusy] = React.useState(false);
     const [status, setStatus] = React.useState("");
     const [, bump] = React.useReducer((n) => n + 1, 0);
     React.useEffect(() => api.settings.onChange(bump), []); // live ⚙ edits
 
-    // Generic chrome (buttons, layout) comes from the shared core UI kit so it
-    // matches the app exactly; the Slider is a core component and the on-canvas
-    // ring overlay is bespoke domain UI, both left as-is.
-    if (!api.ui) return h("div", { style: { padding: "10px", fontSize: "11px", color: "var(--color-text-muted)" } }, "Update Safelight to use this panel.");
     const { Button, Row } = api.ui;
 
     const spots = readSpots(paramBag);
-    const sel = selected != null ? spots.find((s) => s.slot === selected) || null : null;
-
-    const setActive = (v) => {
-      useTool.getState().setActive(v);
-      if (v) dev().setActiveTool("none"); // suppress core mask/retouch overlays
-    };
+    const sel = active && selected != null ? spots.find((s) => s.slot === selected) || null : null;
 
     const detect = async () => {
       setBusy(true);
@@ -754,7 +703,7 @@ export function activate(api) {
     };
 
     const editor = h("div", { className: "space-y-0.5 rounded bg-surface-2/50 p-1.5", key: "editor" },
-      h(Slider, { label: "Size", value: sizeVal, min: 0.2, max: 10, step: 0.1, defaultValue: DEFAULTS.size, onChange: setSize, onCommit: () => sel && commit() }),
+      h(Slider, { label: "Size", value: sizeVal, min: SIZE_MIN, max: SIZE_MAX, step: 0.1, defaultValue: DEFAULTS.size, onChange: setSize, onCommit: () => sel && commit() }),
       h(Slider, { label: "Darken", value: darkenVal, min: 0, max: 100, step: 1, defaultValue: DEFAULTS.darken, onChange: (v) => setPar("darken", v), onCommit: () => sel && commit() }),
       h(Slider, { label: "Desaturate", value: desatVal, min: 0, max: 100, step: 1, defaultValue: DEFAULTS.desat, onChange: (v) => setPar("desat", v), onCommit: () => sel && commit() }),
       h(Slider, { label: "Feather", value: featherVal, min: 0, max: 100, step: 1, defaultValue: DEFAULTS.feather, onChange: (v) => setPar("feather", v), onCommit: () => sel && commit() }),
@@ -768,16 +717,17 @@ export function activate(api) {
             active,
             full: true,
             disabled: !photoId,
+            title: TOOL_HINT,
             onClick: () => setActive(!active),
           }, active ? "Done" : "Correct"),
           h(Button, {
             variant: "secondary",
             full: true,
             disabled: busy || !photoId,
+            title: "Scan the photo for red eyes and correct them",
             onClick: detect,
           }, busy ? "Scanning…" : "Auto-detect"),
         ),
-        active && h("div", { className: "text-[10px] text-text-muted" }, TOOL_HINT),
         status && h("div", { className: "text-[10px] text-text-muted" }, status),
         spots.length >= MAX_SPOTS && h("div", { className: "text-[10px] text-label-red" },
           `Correction limit (${MAX_SPOTS}) reached.`),
@@ -800,13 +750,11 @@ export function activate(api) {
                 },
               }, s.enabled ? "◉" : "○"),
               h("span", { className: "flex-1 truncate" }, `Eye ${i + 1}`),
-              // Match the app's hover-reveal delete control (core MasksPanel): a
-              // muted "×" hidden until the row (.group) is hovered, then shown
-              // (group-hover:opacity-100) and turning red on its own hover.
-              h("button", {
-                type: "button",
+              h(Button, {
+                variant: "ghost",
+                size: "sm",
                 title: "Remove",
-                className: "rounded px-1 text-text-muted opacity-0 hover:text-label-red group-hover:opacity-100",
+                className: "opacity-0 group-hover:opacity-100",
                 onClick: (e) => {
                   e.stopPropagation();
                   removeSpot(s.slot);
@@ -818,9 +766,6 @@ export function activate(api) {
           ),
         ),
         editor,
-        spots.length === 0 && !status &&
-          h("div", { className: "text-[10px] text-text-muted" },
-            "Auto-detect scans the photo, or press Correct and click each eye. Drag to size; drag a ring to move."),
       ),
     );
   }
@@ -837,7 +782,5 @@ export function deactivate() {
   // Panels/slots/settings are auto-swept by the host. Drop the GPU stage too so
   // disabling the extension stops contributing to the render pipeline.
   try { unregisterStage?.(); } catch { /* host may have already swept it */ }
-  try { unsubTool?.(); } catch { /* already torn down */ }
   unregisterStage = null;
-  unsubTool = null;
 }
